@@ -22,21 +22,30 @@ import org.jetbrains.ide.mcp.Response
 import org.jetbrains.mcpserverplugin.AbstractMcpTool
 import org.jetbrains.mcpserverplugin.general.relativizeByProjectDir
 import org.jetbrains.mcpserverplugin.general.resolveRel
-import kotlin.text.replace
+import org.jetbrains.mcpserverplugin.general.GetFileErrorsArgs
+import org.jetbrains.mcpserverplugin.general.GetFileErrorsByPathTool
 
 class GetCurrentFileTextTool : AbstractMcpTool<NoArgs>() {
     override val name: String = "get_open_in_editor_file_text"
     override val description: String = """
-        Retrieves the complete text content of the currently active file in the JetBrains IDE editor.
-        Use this tool to access and analyze the file's contents for tasks such as code review, content inspection, or text processing.
-        Returns empty string if no file is currently open.
+        Retrieves the complete text content and relative path of the currently active file in the JetBrains IDE editor.
+        Use this tool to access and analyze the file's contents and location for tasks such as code review, content inspection, or text processing.
+        Returns an empty JSON object if no file is currently open.
+        Response format: {"path": "<relative_path>", "text": "<file_content>"}
     """.trimIndent()
 
     override fun handle(project: Project, args: NoArgs): Response {
-        val text = runReadAction<String?> {
-            FileEditorManager.getInstance(project).selectedTextEditor?.document?.text
+        val projectDir = project.guessProjectDir()?.toNioPathOrNull()
+        val editor = FileEditorManager.getInstance(project).selectedTextEditor
+        val document = editor?.document
+        val virtualFile = document?.let { FileDocumentManager.getInstance().getFile(it) }
+        val text = document?.text
+        val relPath = virtualFile?.toNioPathOrNull()?.relativizeByProjectDir(projectDir)
+        return if (text != null && relPath != null) {
+            Response("""{"path": "$relPath", "text": ${text.trimIndent().replace("\"", "\\\"").replace("\n", "\\n")}}""")
+        } else {
+            Response("{}")
         }
-        return Response(text ?: "")
     }
 }
 
@@ -119,38 +128,40 @@ class ReplaceSelectedTextTool : AbstractMcpTool<ReplaceSelectedTextArgs>() {
     }
 }
 
-@Serializable
-data class ReplaceCurrentFileTextArgs(val text: String)
+// Remove this as this is error prone and not needed
 
-class ReplaceCurrentFileTextTool : AbstractMcpTool<ReplaceCurrentFileTextArgs>() {
-    override val name: String = "replace_current_file_text"
-    override val description: String = """
-        Replaces the entire content of the currently active file in the JetBrains IDE with specified new text.
-        Use this tool when you need to completely overwrite the current file's content.
-        Requires a text parameter containing the new content.
-        Returns one of three possible responses:
-        - "ok" if the file content was successfully replaced
-        - "no file open" if no editor is active
-        - "unknown error" if the operation fails
-    """
+// @Serializable
+// data class ReplaceCurrentFileTextArgs(val text: String)
 
-    override fun handle(project: Project, args: ReplaceCurrentFileTextArgs): Response {
-        var response: Response? = null
-        application.invokeAndWait {
-            runWriteCommandAction(project, "Replace File Text", null, {
-                val editor = FileEditorManager.getInstance(project).selectedTextEditor
-                val document = editor?.document
-                if (document != null) {
-                    document.setText(args.text)
-                    response = Response("ok")
-                } else {
-                    response = Response(error = "no file open")
-                }
-            })
-        }
-        return response ?: Response(error = "unknown error")
-    }
-}
+// class ReplaceCurrentFileTextTool : AbstractMcpTool<ReplaceCurrentFileTextArgs>() {
+//     override val name: String = "replace_current_file_text"
+//     override val description: String = """
+//         Replaces the entire content of the currently active file in the JetBrains IDE with specified new text.
+//         Use this tool when you need to completely overwrite the current file's content.
+//         Requires a text parameter containing the new content.
+//         Returns one of three possible responses:
+//         - "ok" if the file content was successfully replaced
+//         - "no file open" if no editor is active
+//         - "unknown error" if the operation fails
+//     """
+
+//     override fun handle(project: Project, args: ReplaceCurrentFileTextArgs): Response {
+//         var response: Response? = null
+//         application.invokeAndWait {
+//             runWriteCommandAction(project, "Replace File Text", null, {
+//                 val editor = FileEditorManager.getInstance(project).selectedTextEditor
+//                 val document = editor?.document
+//                 if (document != null) {
+//                     document.setText(args.text)
+//                     response = Response("ok")
+//                 } else {
+//                     response = Response(error = "no file open")
+//                 }
+//             })
+//         }
+//         return response ?: Response(error = "unknown error")
+//     }
+// }
 
 @Serializable
 data class PathInProject(val pathInProject: String)
@@ -188,6 +199,67 @@ class GetFileTextByPathTool : AbstractMcpTool<PathInProject>() {
 }
 
 @Serializable
+data class GetFileLineRangeArgs(
+    val pathInProject: String,
+    val fromLine: Int? = 1, // 1-based, inclusive
+    val numLines: Int? = null,   // 1-based, inclusive
+    val withLineNumbers: Boolean = false
+)
+
+class GetFileLineRangeTool : AbstractMcpTool<GetFileLineRangeArgs>() {
+    override val name: String = "get_file_line_range"
+    override val description: String = """
+        Retrieves a specific line range from a file using its path relative to the project root.
+        Parameters:
+        - pathInProject: Path to the file, relative to project root (required)
+        - fromLine: Start line number (1-based, inclusive, optional). If not provided, defaults to 1.
+        - numLines: Number of lines to retrieve (optional, if not provided, retrieves until the end of the file)
+        - withLineNumbers: If true, prefixes each line with its line number (default: false)
+        Returns:
+        - JSON object: {"path": "<relative_path>", "text": "<file_content>"}
+        - error "project dir not found" if project directory cannot be determined
+        - error "file not found" if the file doesn't exist or is outside project scope
+        - error "invalid line range" if the range is invalid
+        Note: Automatically refreshes the file system before reading.
+    """.trimIndent()
+
+    override fun handle(project: Project, args: GetFileLineRangeArgs): Response {
+        val projectDir = project.guessProjectDir()?.toNioPathOrNull()
+            ?: return Response(error = "project dir not found")
+
+        return runReadAction {
+            val file = LocalFileSystem.getInstance()
+                .refreshAndFindFileByNioFile(projectDir.resolveRel(args.pathInProject))
+                ?: return@runReadAction Response(error = "file not found")
+
+            if (!GlobalSearchScope.allScope(project).contains(file)) {
+                return@runReadAction Response(error = "file not found")
+            }
+
+            val allLines = file.readText().lines()
+            val from = args.fromLine?.coerceAtLeast(1) ?: 1
+            val to = if (args.numLines != null) {
+                (from + args.numLines - 1).coerceAtMost(allLines.size)
+            } else {
+                allLines.size
+            }
+
+            if (from > to || from > allLines.size) {
+                return@runReadAction Response(error = "invalid line range")
+            }
+
+            val selectedLines = allLines.subList(from - 1, to)
+            val content = if (args.withLineNumbers) {
+                selectedLines.mapIndexed { idx, line -> "${from + idx}: $line" }.joinToString("\n")
+            } else {
+                selectedLines.joinToString("\n")
+            }
+            Response("""{"path": "${args.pathInProject}", "text": "${content.replace("\"", "\\\"").replace("\n", "\\n")}"}""")
+        }
+    }
+}
+
+@Serializable
 data class ReplaceSpecificTextArgs(val pathInProject: String, val oldText: String, val newText: String)
 
 class ReplaceSpecificTextTool : AbstractMcpTool<ReplaceSpecificTextArgs>() {
@@ -202,20 +274,28 @@ class ReplaceSpecificTextTool : AbstractMcpTool<ReplaceSpecificTextArgs>() {
         - oldText: The text to be replaced
         - newText: The replacement text
         Returns one of these responses:
-        - "ok" when replacement happend
+        - JSON object: {"path": "<relative_path>", "text": "<new_file_content>"}
         - error "project dir not found" if project directory cannot be determined
         - error "file not found" if the file doesn't exist
         - error "could not get document" if the file content cannot be accessed
         - error "no occurrences found" if the old text was not found in the file
+        - error "empty oldText not allowed"
+        - error "replacement would drastically change line count"
         Note: Automatically saves the file after modification
-    """
+        Additionally, always returns the file's error/warning info after modification.
+    """.trimIndent()
 
     override fun handle(project: Project, args: ReplaceSpecificTextArgs): Response {
         val projectDir = project.guessProjectDir()?.toNioPathOrNull()
             ?: return Response(error = "project dir not found")
 
+        // Check for empty oldText
+        if (args.oldText.isBlank()) {
+            return Response(error = "empty oldText not allowed")
+        }
+
         var document: Document? = null
-        
+
         val readResult = runReadAction {
             val file: VirtualFile = LocalFileSystem.getInstance()
                 .refreshAndFindFileByNioFile(projectDir.resolveRel(args.pathInProject))
@@ -237,18 +317,34 @@ class ReplaceSpecificTextTool : AbstractMcpTool<ReplaceSpecificTextArgs>() {
             return Response(error = readResult)
         }
 
-        val text = document!!.text
-        if (!text.contains(args.oldText)) {
+        val oldText = document!!.text
+        if (!oldText.contains(args.oldText)) {
             return Response(error = "no occurrences found")
         }
 
-        val newText = text.replace(args.oldText, args.newText, true)
+        val newText = oldText.replace(args.oldText, args.newText, true)
+
+        // Check for drastic file size increase (e.g., more than double)
+        if (newText.length > oldText.length * 2) {
+            return Response(error = "replacement would double file size")
+        }
+
+        // Check for drastic line count change (e.g., more than 2x or less than half)
+        val oldLines = oldText.lines().size
+        val newLines = newText.lines().size
+        if (newLines > oldLines * 2 || newLines < oldLines / 2) {
+            return Response(error = "replacement would drastically change line count")
+        }
+
         WriteCommandAction.runWriteCommandAction(project) {
             document!!.setText(newText)
             FileDocumentManager.getInstance().saveDocument(document!!)
+            PsiDocumentManager.getInstance(project).commitDocument(document!!)
         }
 
-        return Response("ok")
+        // Always return file errors after modification
+        val errorTool = GetFileErrorsByPathTool()
+        return errorTool.handle(project, GetFileErrorsArgs(args.pathInProject))
     }
 }
 
@@ -269,7 +365,8 @@ class ReplaceTextByPathTool : AbstractMcpTool<ReplaceTextByPathToolArgs>() {
         - error "file not found" if the file doesn't exist
         - error "could not get document" if the file content cannot be accessed
         Note: Automatically saves the file after modification
-    """
+        Additionally, always returns the file's error/warning info after modification.
+    """.trimIndent()
 
     override fun handle(project: Project, args: ReplaceTextByPathToolArgs): Response {
         val projectDir = project.guessProjectDir()?.toNioPathOrNull()
@@ -301,8 +398,11 @@ class ReplaceTextByPathTool : AbstractMcpTool<ReplaceTextByPathToolArgs>() {
         WriteCommandAction.runWriteCommandAction(project) {
             document!!.setText(args.text)
             FileDocumentManager.getInstance().saveDocument(document!!)
+            PsiDocumentManager.getInstance(project).commitDocument(document!!)
         }
 
-        return Response("ok")
+        // Always return file errors after modification
+        val errorTool = GetFileErrorsByPathTool()
+        return errorTool.handle(project, GetFileErrorsArgs(args.pathInProject))
     }
 }
